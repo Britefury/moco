@@ -5,9 +5,9 @@ import builtins
 import math
 import os
 import random
-import shutil
 import time
 import warnings
+import itertools
 
 import torch
 import torch.nn as nn
@@ -18,20 +18,21 @@ import torch.optim
 import torch.multiprocessing as mp
 import torch.utils.data
 import torch.utils.data.distributed
-import torchvision.transforms as transforms
-import torchvision.datasets as datasets
-import torchvision.models as models
 
 import moco.loader
 import moco.builder
+import moco.architectures
+import moco.datasets
 
-model_names = sorted(name for name in models.__dict__
-    if name.islower() and not name.startswith("__")
-    and callable(models.__dict__[name]))
+model_names = sorted(moco.architectures.models_dict.keys())
 
 parser = argparse.ArgumentParser(description='PyTorch ImageNet Training')
-parser.add_argument('data', metavar='DIR',
-                    help='path to dataset')
+parser.add_argument('--job_name', metavar='JOBNAME',
+                    help='job name', default='moco_imagenet')
+parser.add_argument('--dataset', metavar='DATASET',
+                    help='dataset; imagenet | cifar10')
+parser.add_argument('--data_dir', metavar='DIR',
+                    help='path to imagenet')
 parser.add_argument('-a', '--arch', metavar='ARCH', default='resnet50',
                     choices=model_names,
                     help='model architecture: ' +
@@ -156,9 +157,11 @@ def main_worker(gpu, ngpus_per_node, args):
                                 world_size=args.world_size, rank=args.rank)
     # create model
     print("=> creating model '{}'".format(args.arch))
+
     model = moco.builder.MoCo(
-        models.__dict__[args.arch],
-        args.moco_dim, args.moco_k, args.moco_m, args.moco_t, args.mlp)
+        moco.architectures.models_dict[args.arch],
+        args.moco_dim, args.moco_k, args.moco_m, args.moco_t, args.mlp,
+        single_gpu=not args.distributed)
     print(model)
 
     if args.distributed:
@@ -183,7 +186,7 @@ def main_worker(gpu, ngpus_per_node, args):
         torch.cuda.set_device(args.gpu)
         model = model.cuda(args.gpu)
         # comment out the following line for debugging
-        raise NotImplementedError("Only DistributedDataParallel is supported.")
+        # raise NotImplementedError("Only DistributedDataParallel is supported.")
     else:
         # AllGather implementation (batch shuffle, queue update, etc.) in
         # this code only supports DistributedDataParallel.
@@ -201,7 +204,8 @@ def main_worker(gpu, ngpus_per_node, args):
         if os.path.isfile(args.resume):
             print("=> loading checkpoint '{}'".format(args.resume))
             if args.gpu is None:
-                checkpoint = torch.load(args.resume)
+                # checkpoint = torch.load(args.resume)
+                checkpoint = torch.load(args.resume, map_location='cuda:0')
             else:
                 # Map model to be loaded to specified single gpu.
                 loc = 'cuda:{}'.format(args.gpu)
@@ -217,45 +221,22 @@ def main_worker(gpu, ngpus_per_node, args):
     cudnn.benchmark = True
 
     # Data loading code
-    traindir = os.path.join(args.data, 'train')
-    normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                                     std=[0.229, 0.224, 0.225])
-    if args.aug_plus:
-        # MoCo v2's aug: similar to SimCLR https://arxiv.org/abs/2002.05709
-        augmentation = [
-            transforms.RandomResizedCrop(224, scale=(0.2, 1.)),
-            transforms.RandomApply([
-                transforms.ColorJitter(0.4, 0.4, 0.4, 0.1)  # not strengthened
-            ], p=0.8),
-            transforms.RandomGrayscale(p=0.2),
-            transforms.RandomApply([moco.loader.GaussianBlur([.1, 2.])], p=0.5),
-            transforms.RandomHorizontalFlip(),
-            transforms.ToTensor(),
-            normalize
-        ]
-    else:
-        # MoCo v1's aug: the same as InstDisc https://arxiv.org/abs/1805.01978
-        augmentation = [
-            transforms.RandomResizedCrop(224, scale=(0.2, 1.)),
-            transforms.RandomGrayscale(p=0.2),
-            transforms.ColorJitter(0.4, 0.4, 0.4, 0.4),
-            transforms.RandomHorizontalFlip(),
-            transforms.ToTensor(),
-            normalize
-        ]
-
-    train_dataset = datasets.ImageFolder(
-        traindir,
-        moco.loader.TwoCropsTransform(transforms.Compose(augmentation)))
+    train_dataset = moco.datasets.load_moco_train_set(args.dataset, args.data_dir, args.aug_plus)
 
     if args.distributed:
         train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset)
+        iters_per_epoch = None
     else:
-        train_sampler = None
+        train_sampler = moco.datasets.InfiniteSampler(train_dataset)
+        iters_per_epoch = len(train_dataset) // args.batch_size
 
     train_loader = torch.utils.data.DataLoader(
         train_dataset, batch_size=args.batch_size, shuffle=(train_sampler is None),
         num_workers=args.workers, pin_memory=True, sampler=train_sampler, drop_last=True)
+
+    checkpoint_filename = 'checkpoint_moco_{}.pth.tar'.format(args.job_name)
+    print('Training...')
+    train_iter = iter(train_loader)
 
     for epoch in range(args.start_epoch, args.epochs):
         if args.distributed:
@@ -263,7 +244,7 @@ def main_worker(gpu, ngpus_per_node, args):
         adjust_learning_rate(optimizer, epoch, args)
 
         # train for one epoch
-        train(train_loader, model, criterion, optimizer, epoch, args)
+        train(train_iter, model, criterion, optimizer, epoch, iters_per_epoch, args)
 
         if not args.multiprocessing_distributed or (args.multiprocessing_distributed
                 and args.rank % ngpus_per_node == 0):
@@ -272,17 +253,17 @@ def main_worker(gpu, ngpus_per_node, args):
                 'arch': args.arch,
                 'state_dict': model.state_dict(),
                 'optimizer' : optimizer.state_dict(),
-            }, is_best=False, filename='checkpoint_{:04d}.pth.tar'.format(epoch))
+            }, filename=checkpoint_filename)
 
 
-def train(train_loader, model, criterion, optimizer, epoch, args):
+def train(train_iter, model, criterion, optimizer, epoch, iters_per_epoch, args):
     batch_time = AverageMeter('Time', ':6.3f')
     data_time = AverageMeter('Data', ':6.3f')
     losses = AverageMeter('Loss', ':.4e')
     top1 = AverageMeter('Acc@1', ':6.2f')
     top5 = AverageMeter('Acc@5', ':6.2f')
     progress = ProgressMeter(
-        len(train_loader),
+        iters_per_epoch,
         [batch_time, data_time, losses, top1, top5],
         prefix="Epoch: [{}]".format(epoch))
 
@@ -290,7 +271,7 @@ def train(train_loader, model, criterion, optimizer, epoch, args):
     model.train()
 
     end = time.time()
-    for i, (images, _) in enumerate(train_loader):
+    for i, (images, _) in enumerate(itertools.islice(train_iter, iters_per_epoch)):
         # measure data loading time
         data_time.update(time.time() - end)
 
@@ -322,10 +303,12 @@ def train(train_loader, model, criterion, optimizer, epoch, args):
             progress.display(i)
 
 
-def save_checkpoint(state, is_best, filename='checkpoint.pth.tar'):
-    torch.save(state, filename)
-    if is_best:
-        shutil.copyfile(filename, 'model_best.pth.tar')
+def save_checkpoint(state, filename):
+    new_filename = filename + '.new'
+    torch.save(state, new_filename)
+    if os.path.exists(filename):
+        os.remove(filename)
+    os.rename(new_filename, filename)
 
 
 class AverageMeter(object):

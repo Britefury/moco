@@ -7,6 +7,7 @@ import random
 import shutil
 import time
 import warnings
+import itertools
 
 import torch
 import torch.nn as nn
@@ -17,17 +18,19 @@ import torch.optim
 import torch.multiprocessing as mp
 import torch.utils.data
 import torch.utils.data.distributed
-import torchvision.transforms as transforms
-import torchvision.datasets as datasets
-import torchvision.models as models
 
-model_names = sorted(name for name in models.__dict__
-    if name.islower() and not name.startswith("__")
-    and callable(models.__dict__[name]))
+import moco.architectures
+import moco.datasets
+
+model_names = sorted(moco.architectures.models_dict.keys())
 
 parser = argparse.ArgumentParser(description='PyTorch ImageNet Training')
-parser.add_argument('data', metavar='DIR',
-                    help='path to dataset')
+parser.add_argument('--job_name', metavar='JOBNAME',
+                    help='job name', default='moco_imagenet')
+parser.add_argument('--dataset', metavar='DATASET',
+                    help='dataset; imagenet | cifar10')
+parser.add_argument('--data_dir', metavar='DIR',
+                    help='path to imagenet')
 parser.add_argument('-a', '--arch', metavar='ARCH', default='resnet50',
                     choices=model_names,
                     help='model architecture: ' +
@@ -77,9 +80,6 @@ parser.add_argument('--multiprocessing-distributed', action='store_true',
                          'fastest way to use PyTorch for either single node or '
                          'multi node data parallel training')
 
-parser.add_argument('--pretrained', default='', type=str,
-                    help='path to moco pretrained checkpoint')
-
 best_acc1 = 0
 
 
@@ -118,6 +118,21 @@ def main():
         main_worker(args.gpu, ngpus_per_node, args)
 
 
+def get_encoder_state(state_dict):
+    state_dict = state_dict.copy()
+    for k in list(state_dict.keys()):
+        # retain only encoder_q up to before the embedding layer
+        if k.startswith('module.encoder_q') and not k.startswith('module.encoder_q.fc'):
+            # remove prefix
+            state_dict[k[len("module.encoder_q."):]] = state_dict[k]
+        elif k.startswith('encoder_q') and not k.startswith('encoder_q.fc'):
+            # remove prefix
+            state_dict[k[len("encoder_q."):]] = state_dict[k]
+        # delete renamed or unused k
+        del state_dict[k]
+    return state_dict
+
+
 def main_worker(gpu, ngpus_per_node, args):
     global best_acc1
     args.gpu = gpu
@@ -140,9 +155,17 @@ def main_worker(gpu, ngpus_per_node, args):
             args.rank = args.rank * ngpus_per_node + gpu
         dist.init_process_group(backend=args.dist_backend, init_method=args.dist_url,
                                 world_size=args.world_size, rank=args.rank)
+
+    if args.dataset == 'imagenet':
+        num_classes = 1000
+    elif args.dataset == 'cifar10':
+        num_classes = 10
+    else:
+        raise ValueError
+
     # create model
     print("=> creating model '{}'".format(args.arch))
-    model = models.__dict__[args.arch]()
+    model = moco.architectures.models_dict[args.arch](num_classes)
 
     # freeze all layers but the last fc
     for name, param in model.named_parameters():
@@ -152,29 +175,24 @@ def main_worker(gpu, ngpus_per_node, args):
     model.fc.weight.data.normal_(mean=0.0, std=0.01)
     model.fc.bias.data.zero_()
 
+    checkpoint_filename = 'checkpoint_moco_{}.pth.tar'.format(args.job_name)
+
     # load from pre-trained, before DistributedDataParallel constructor
-    if args.pretrained:
-        if os.path.isfile(args.pretrained):
-            print("=> loading checkpoint '{}'".format(args.pretrained))
-            checkpoint = torch.load(args.pretrained, map_location="cpu")
+    if os.path.exists(checkpoint_filename):
+        if os.path.isfile(checkpoint_filename):
+            print("=> loading checkpoint '{}'".format(checkpoint_filename))
+            checkpoint = torch.load(checkpoint_filename, map_location="cpu")
 
             # rename moco pre-trained keys
-            state_dict = checkpoint['state_dict']
-            for k in list(state_dict.keys()):
-                # retain only encoder_q up to before the embedding layer
-                if k.startswith('module.encoder_q') and not k.startswith('module.encoder_q.fc'):
-                    # remove prefix
-                    state_dict[k[len("module.encoder_q."):]] = state_dict[k]
-                # delete renamed or unused k
-                del state_dict[k]
+            state_dict = get_encoder_state(checkpoint['state_dict'])
 
             args.start_epoch = 0
             msg = model.load_state_dict(state_dict, strict=False)
             assert set(msg.missing_keys) == {"fc.weight", "fc.bias"}
 
-            print("=> loaded pre-trained model '{}'".format(args.pretrained))
+            print("=> loaded pre-trained model '{}'".format(checkpoint_filename))
         else:
-            print("=> no checkpoint found at '{}'".format(args.pretrained))
+            print("=> no checkpoint found at '{}'".format(checkpoint_filename))
 
     if args.distributed:
         # For multiprocessing distributed, DistributedDataParallel constructor
@@ -239,54 +257,48 @@ def main_worker(gpu, ngpus_per_node, args):
 
     cudnn.benchmark = True
 
-    # Data loading code
-    traindir = os.path.join(args.data, 'train')
-    valdir = os.path.join(args.data, 'val')
-    normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                                     std=[0.229, 0.224, 0.225])
-
-    train_dataset = datasets.ImageFolder(
-        traindir,
-        transforms.Compose([
-            transforms.RandomResizedCrop(224),
-            transforms.RandomHorizontalFlip(),
-            transforms.ToTensor(),
-            normalize,
-        ]))
+    train_dataset, val_dataset = moco.datasets.load_clf_train_val_set(args.dataset, args.data_dir)
 
     if args.distributed:
         train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset)
+        iters_per_epoch = None
     else:
-        train_sampler = None
+        train_sampler = moco.datasets.InfiniteSampler(train_dataset)
+        iters_per_epoch = len(train_dataset) // args.batch_size
 
     train_loader = torch.utils.data.DataLoader(
         train_dataset, batch_size=args.batch_size, shuffle=(train_sampler is None),
         num_workers=args.workers, pin_memory=True, sampler=train_sampler)
 
     val_loader = torch.utils.data.DataLoader(
-        datasets.ImageFolder(valdir, transforms.Compose([
-            transforms.Resize(256),
-            transforms.CenterCrop(224),
-            transforms.ToTensor(),
-            normalize,
-        ])),
-        batch_size=args.batch_size, shuffle=False,
+        val_dataset, batch_size=args.batch_size, shuffle=False,
         num_workers=args.workers, pin_memory=True)
+
+    val_iters_per_epoch = len(val_dataset) // args.batch_size
+    if len(val_dataset) % args.batch_size > 0:
+        val_iters_per_epoch += 1
 
     if args.evaluate:
         validate(val_loader, model, criterion, args)
         return
+
+    clf_checkpoint_filename = 'checkpoint_classifier_{}.pth.tar'.format(args.job_name)
+    best_filename = 'best_classifier_{}.pth.tar'.format(args.job_name)
+    print('Training...')
+    train_iter = iter(train_loader)
 
     for epoch in range(args.start_epoch, args.epochs):
         if args.distributed:
             train_sampler.set_epoch(epoch)
         adjust_learning_rate(optimizer, epoch, args)
 
+        val_iter = iter(val_loader)
+
         # train for one epoch
-        train(train_loader, model, criterion, optimizer, epoch, args)
+        train(train_iter, model, criterion, optimizer, epoch, iters_per_epoch, args)
 
         # evaluate on validation set
-        acc1 = validate(val_loader, model, criterion, args)
+        acc1 = validate(val_iter, model, criterion, val_iters_per_epoch, args)
 
         # remember best acc@1 and save checkpoint
         is_best = acc1 > best_acc1
@@ -300,19 +312,19 @@ def main_worker(gpu, ngpus_per_node, args):
                 'state_dict': model.state_dict(),
                 'best_acc1': best_acc1,
                 'optimizer' : optimizer.state_dict(),
-            }, is_best)
+            }, is_best, clf_checkpoint_filename, best_filename)
             if epoch == args.start_epoch:
-                sanity_check(model.state_dict(), args.pretrained)
+                sanity_check(model.state_dict(), checkpoint_filename)
 
 
-def train(train_loader, model, criterion, optimizer, epoch, args):
+def train(train_iter, model, criterion, optimizer, epoch, iters_per_epoch, args):
     batch_time = AverageMeter('Time', ':6.3f')
     data_time = AverageMeter('Data', ':6.3f')
     losses = AverageMeter('Loss', ':.4e')
     top1 = AverageMeter('Acc@1', ':6.2f')
     top5 = AverageMeter('Acc@5', ':6.2f')
     progress = ProgressMeter(
-        len(train_loader),
+        iters_per_epoch,
         [batch_time, data_time, losses, top1, top5],
         prefix="Epoch: [{}]".format(epoch))
 
@@ -326,7 +338,7 @@ def train(train_loader, model, criterion, optimizer, epoch, args):
     model.eval()
 
     end = time.time()
-    for i, (images, target) in enumerate(train_loader):
+    for i, (images, target) in enumerate(itertools.islice(train_iter, iters_per_epoch)):
         # measure data loading time
         data_time.update(time.time() - end)
 
@@ -357,13 +369,13 @@ def train(train_loader, model, criterion, optimizer, epoch, args):
             progress.display(i)
 
 
-def validate(val_loader, model, criterion, args):
+def validate(val_iter, model, criterion, val_iters_per_epoch, args):
     batch_time = AverageMeter('Time', ':6.3f')
     losses = AverageMeter('Loss', ':.4e')
     top1 = AverageMeter('Acc@1', ':6.2f')
     top5 = AverageMeter('Acc@5', ':6.2f')
     progress = ProgressMeter(
-        len(val_loader),
+        val_iters_per_epoch,
         [batch_time, losses, top1, top5],
         prefix='Test: ')
 
@@ -372,7 +384,7 @@ def validate(val_loader, model, criterion, args):
 
     with torch.no_grad():
         end = time.time()
-        for i, (images, target) in enumerate(val_loader):
+        for i, (images, target) in enumerate(val_iter):
             if args.gpu is not None:
                 images = images.cuda(args.gpu, non_blocking=True)
             target = target.cuda(args.gpu, non_blocking=True)
@@ -401,10 +413,15 @@ def validate(val_loader, model, criterion, args):
     return top1.avg
 
 
-def save_checkpoint(state, is_best, filename='checkpoint.pth.tar'):
-    torch.save(state, filename)
+def save_checkpoint(state, is_best, filename, best_filename):
+    new_filename = filename + '.new'
+    torch.save(state, new_filename)
+    if os.path.exists(filename):
+        os.remove(filename)
+    os.rename(new_filename, filename)
+
     if is_best:
-        shutil.copyfile(filename, 'model_best.pth.tar')
+        shutil.copyfile(filename, best_filename)
 
 
 def sanity_check(state_dict, pretrained_weights):
@@ -414,18 +431,14 @@ def sanity_check(state_dict, pretrained_weights):
     """
     print("=> loading '{}' for sanity check".format(pretrained_weights))
     checkpoint = torch.load(pretrained_weights, map_location="cpu")
-    state_dict_pre = checkpoint['state_dict']
+    state_dict_pre = get_encoder_state(checkpoint['state_dict'])
 
     for k in list(state_dict.keys()):
         # only ignore fc layer
         if 'fc.weight' in k or 'fc.bias' in k:
             continue
 
-        # name in pretrained model
-        k_pre = 'module.encoder_q.' + k[len('module.'):] \
-            if k.startswith('module.') else 'module.encoder_q.' + k
-
-        assert ((state_dict[k].cpu() == state_dict_pre[k_pre]).all()), \
+        assert ((state_dict[k].cpu() == state_dict_pre[k]).all()), \
             '{} is changed in linear classifier training.'.format(k)
 
     print("=> sanity check passed.")
