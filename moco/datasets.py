@@ -45,7 +45,9 @@ class InfiniteSampler(torch.utils.data.Sampler):
 def load_moco_train_set(dataset_name, data_dir, aug_plus):
     # Data loading code
     if dataset_name == 'imagenet':
-        imagenet_dir = os.path.join(data_dir, 'train')
+        train_dir = os.path.join(data_dir, 'train')
+        if not os.path.exists(train_dir):
+            train_dir = data_dir
         normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
                                          std=[0.229, 0.224, 0.225])
         if aug_plus:
@@ -73,7 +75,7 @@ def load_moco_train_set(dataset_name, data_dir, aug_plus):
             ]
 
         return datasets.ImageFolder(
-            imagenet_dir,
+            train_dir,
             moco.loader.TwoCropsTransform(transforms.Compose(augmentation)))
 
     elif dataset_name == 'cifar10':
